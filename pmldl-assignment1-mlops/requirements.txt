@@ -1,0 +1,12 @@
+# PMLDL Assignment 1 — pipeline dependencies (stages 1–2, scheduler)
+pandas==2.2.3
+scikit-learn==1.6.1
+mlflow==2.19.0
+
+# deployment (API + app are containerized with their own requirements,
+# these are for running the services outside Docker / for local testing)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+streamlit==1.41.1
+requests==2.32.3
+pydantic==2.10.5

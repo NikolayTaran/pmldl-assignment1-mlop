@@ -1,0 +1,38 @@
+# Stage 3 — Deployment: model API + web app in separate containers.
+#
+# Run from the repository root:
+#     docker compose -f code/deployment/docker-compose.yml up -d --build
+#
+# * api  — FastAPI serving models/model.pkl   -> http://localhost:8000  (docs: /docs)
+# * app  — Streamlit UI calling the api       -> http://localhost:8501
+#
+# The ./models directory is mounted into the api container, so every
+# pipeline cycle (Stage 2 retrains the model) automatically serves the
+# fresh model after the containers restart.
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: code/deployment/api/Dockerfile
+    container_name: titanic-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../models:/srv/models:ro
+    environment:
+      - MODEL_DIR=/srv/models
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ../..
+      dockerfile: code/deployment/app/Dockerfile
+    container_name: titanic-app
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
