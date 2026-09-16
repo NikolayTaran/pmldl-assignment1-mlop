@@ -2,20 +2,36 @@
 
 Serves the Titanic survival model trained by Stage 2.
 Endpoints:
-    GET  /health   — liveness probe + model metadata
+    GET  /         — service info (never "Not Found" again)
+    GET  /health   — liveness probe + model metadata + version diagnostics
     POST /predict  — single or batch prediction with probability
 
 Runs inside its own Docker container (see Dockerfile).
 """
 import os
 import pickle
+import platform
+import traceback
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
+import numpy as np
 import pandas as pd
+import sklearn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+REBUILD_HINT = (
+    "Most common cause: the container was built with an old "
+    "code/deployment/api/requirements.txt (pinned scikit-learn), while the model "
+    "was trained by the scikit-learn installed on the host. Fix: update "
+    "code/deployment/api/requirements.txt to minimum bounds matching your host "
+    "packages, then rebuild and restart the containers: "
+    "docker compose -f code/deployment/docker-compose.yml up -d --build"
+)
+
 
 def _default_models_dir() -> str:
     """Outside Docker: repo_root/models (this file lives in code/deployment/api/).
@@ -34,7 +50,7 @@ FEATURE_COLUMNS = [
 app = FastAPI(
     title="Titanic Survival API",
     description="PMLDL Assignment 1 — model API for Stage 3 (deployment).",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -62,22 +78,69 @@ class BatchIn(BaseModel):
 
 
 _model = None
-_model_loaded_at: "str | None" = None
+_model_loaded_at = None
+_load_warnings = []
+
+
+def _versions() -> dict:
+    return {
+        "python": platform.python_version(),
+        "scikit_learn": sklearn.__version__,
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+    }
 
 
 def get_model():
     """Load the pickle lazily; a fresh container start picks up the latest model."""
-    global _model, _model_loaded_at
+    global _model, _model_loaded_at, _load_warnings
     if _model is None:
         if not MODEL_PATH.is_file():
             raise HTTPException(
                 status_code=503,
-                detail=f"Model file not found at {MODEL_PATH}. Run Stage 2 first.",
+                detail=(
+                    f"Model file not found at {MODEL_PATH}. Run Stage 2 first "
+                    "(python code/models/train_model.py) or check the ./models "
+                    "volume mount in docker-compose.yml."
+                ),
             )
-        with MODEL_PATH.open("rb") as fh:
-            _model = pickle.load(fh)
+        try:
+            # sklearn emits InconsistentVersionWarning here when the pickle was
+            # created by a different sklearn version than the one running now —
+            # capture it and surface it in /health
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with MODEL_PATH.open("rb") as fh:
+                    _model = pickle.load(fh)
+            _load_warnings = [str(w.message) for w in caught]
+        except Exception as exc:
+            traceback.print_exc()  # full traceback stays visible in docker logs
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Could not load the model pickle: {exc.__class__.__name__}: {exc}. "
+                    f"This container runs scikit-learn {sklearn.__version__}. {REBUILD_HINT}"
+                ),
+            ) from exc
         _model_loaded_at = datetime.now(timezone.utc).isoformat()
     return _model
+
+
+def _predict_proba(model, df: pd.DataFrame):
+    """predict_proba with a diagnostic error message instead of a raw 500."""
+    try:
+        return model.predict_proba(df)[:, 1]
+    except Exception as exc:
+        traceback.print_exc()  # full traceback stays visible in docker logs
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Prediction failed: {exc.__class__.__name__}: {exc}. "
+                f"This container runs scikit-learn {sklearn.__version__} — if it differs "
+                "from the version that trained models/model.pkl, the pickle cannot be "
+                f"served (check GET /health, field sklearn_version_match). {REBUILD_HINT}"
+            ),
+        ) from exc
 
 
 def _to_frame(items: list[Passenger]) -> pd.DataFrame:
@@ -88,13 +151,32 @@ def _to_frame(items: list[Passenger]) -> pd.DataFrame:
     return df[FEATURE_COLUMNS]
 
 
+@app.get("/")
+def root() -> dict:
+    """Friendly service index — so the root URL never looks like an error."""
+    return {
+        "service": "Titanic Survival API",
+        "description": "PMLDL Assignment 1 — Stage 3 model API",
+        "usage": {
+            "docs": "/docs",
+            "health": "/health",
+            "predict": 'POST /predict — a single passenger object or {"passengers": [...]}',
+        },
+        "versions": _versions(),
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     model = get_model()
+    version_warnings = [w for w in _load_warnings if "unpickle" in w]
     return {
         "status": "ok",
         "model_loaded_at": _model_loaded_at,
         "model_type": type(model.named_steps.get("clf")).__name__,
+        "versions": _versions(),
+        "sklearn_version_match": not version_warnings,
+        "load_warnings": _load_warnings,
     }
 
 
@@ -104,7 +186,7 @@ def predict(payload: Union[Passenger, BatchIn]) -> Union[PredictionOut, list[Pre
         if not payload.passengers:
             raise HTTPException(status_code=400, detail="passengers list is empty")
         model = get_model()
-        proba = model.predict_proba(_to_frame(payload.passengers))[:, 1]
+        proba = _predict_proba(model, _to_frame(payload.passengers))
         return [
             PredictionOut(
                 survival_probability=round(float(p), 4),
@@ -116,7 +198,7 @@ def predict(payload: Union[Passenger, BatchIn]) -> Union[PredictionOut, list[Pre
         ]
 
     model = get_model()
-    proba = float(model.predict_proba(_to_frame([payload]))[0, 1])
+    proba = float(_predict_proba(model, _to_frame([payload]))[0])
     return PredictionOut(
         survival_probability=round(proba, 4),
         survived=int(proba >= 0.5),
