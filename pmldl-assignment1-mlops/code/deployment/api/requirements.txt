@@ -1,6 +1,9 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pandas==2.2.3
-scikit-learn==1.6.1
-pydantic==2.10.5
-requests==2.32.3
+# API container (python:3.12-slim).
+# Minimum bounds (not exact pins) so that the scikit-learn installed here
+# matches the one that trained models/model.pkl — sklearn pickles are only
+# guaranteed to load with the same library version.
+fastapi>=0.115
+uvicorn[standard]>=0.34
+pydantic>=2.10
+pandas>=2.2
+scikit-learn>=1.4
