@@ -147,12 +147,37 @@ def main() -> None:
         # log the winning model itself as the run's model artifact
         mlflow.log_params({"selected_model": best_name})
         mlflow.log_metrics({f"selected_{k}": v for k, v in best_metrics.items()})
-        mlflow.sklearn.log_model(best_pipeline, artifact_path="model")
 
         # package for deployment: the whole pipeline (preprocessor + classifier)
         model_path = models_dir / "model.pkl"
         with model_path.open("wb") as fh:
             pickle.dump(best_pipeline, fh)
+
+        # log the model to MLflow in a version-robust way:
+        #   * MLflow >= 3 saves sklearn models via skops — needs `name` and
+        #     an explicit list of trusted types (numpy.dtype lives inside the
+        #     sklearn pipeline),
+        #   * MLflow 2.x uses `artifact_path` instead,
+        #   * if neither flavor call works, log the pickle as a plain
+        #     artifact so the run always contains the model.
+        logged = False
+        try:
+            mlflow.sklearn.log_model(
+                best_pipeline, name="model", skops_trusted_types=["numpy.dtype"]
+            )
+            logged = True
+        except Exception as exc:  # MLflow 2.x has no `name`/`skops_trusted_types`
+            print(f"[stage2] sklearn flavor with `name` failed: {exc.__class__.__name__}: {exc}")
+        if not logged:
+            try:
+                mlflow.sklearn.log_model(best_pipeline, artifact_path="model")
+                logged = True
+            except Exception as exc:
+                print(f"[stage2] sklearn flavor with `artifact_path` failed: "
+                      f"{exc.__class__.__name__}: {exc}")
+        if not logged:
+            mlflow.log_artifact(str(model_path), artifact_path="model")
+            print("[stage2] logged model.pkl as a plain MLflow artifact")
 
         metrics_record = {
             "selected_model": best_name,
